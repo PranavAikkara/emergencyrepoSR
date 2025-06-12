@@ -1,0 +1,20 @@
+# Environment variables
+.env
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+smrvenv/
+
+logs/
+lambdatest_for_SR/
+new/
+others/
+refresh_aws_sso.py
+
+
+

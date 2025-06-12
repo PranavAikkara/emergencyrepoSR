@@ -1,0 +1,3 @@
+"""
+Smart Recruit - Main Package
+""" 
