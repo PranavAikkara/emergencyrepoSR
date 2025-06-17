@@ -22,10 +22,10 @@ import time
 logger = get_logger(__name__)
 
 # For local development:
-API_BASE_URL = "http://localhost:8000"
+#API_BASE_URL = "http://localhost:8000"
 
 # For deployment, temporarily change to your Render URL:
-# API_BASE_URL = "https://your-app-name.onrender.com"
+API_BASE_URL = "https://wiserecruit.onrender.com"
 
 st.set_page_config(layout="wide")
 
