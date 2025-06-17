@@ -4,16 +4,17 @@ Vector database client configuration and common operations.
 This module provides:
 1. Client configuration for Qdrant vector database
 2. Collection initialization functions
-3. Embedding generation utilities
+3. Embedding generation utilities using DeepInfra BGE API
 """
 
 import asyncio
 import os
 from typing import List, Dict, Any, Optional
+import aiohttp
 
 from qdrant_client.models import Distance, VectorParams, PayloadSchemaType
 
-from config import qdrant_client, embedding_model
+from config import qdrant_client, get_embedding_config
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -25,8 +26,11 @@ def JD_COLLECTION_NAME():
 def CV_COLLECTION_NAME():
     return "cv_collection"
 
+# Get embedding configuration
+embedding_config = get_embedding_config()
+
 # Vector parameters for collections
-_vector_params = VectorParams(size=1024, distance=Distance.COSINE)
+_vector_params = VectorParams(size=embedding_config["dimensions"], distance=Distance.COSINE)
 
 # --- Initialize Collections ---
 async def _initialize_collection(collection_name: str, vectors_config: VectorParams):
@@ -98,7 +102,7 @@ async def initialize_qdrant_collections():
     Creates JD and CV collections with appropriate vector parameters.
     """
     logger.info("Attempting to initialize Qdrant collections asynchronously...")
-    vector_params = VectorParams(size=1024, distance=Distance.COSINE)
+    vector_params = VectorParams(size=embedding_config["dimensions"], distance=Distance.COSINE)
     await _initialize_collection(JD_COLLECTION_NAME(), vector_params)
     await _initialize_collection(CV_COLLECTION_NAME(), vector_params)
     logger.info("Asynchronous Qdrant collection initialization process completed.")
@@ -106,7 +110,7 @@ async def initialize_qdrant_collections():
 # --- Embedding Generation ---
 async def get_embedding(text: str) -> List[float]:
     """
-    Get embedding vector for the given text.
+    Get embedding vector for the given text using DeepInfra BGE API.
     
     Args:
         text: Text to generate embedding for
@@ -117,11 +121,53 @@ async def get_embedding(text: str) -> List[float]:
     try:
         text = text.strip()
         if not text:
+            logger.warning("Empty text provided for embedding generation")
             return [0.0] * _vector_params.size
-        embedding_val = await asyncio.to_thread(embedding_model.encode, text)
-        return embedding_val.tolist()
+        
+        # Check if API key is configured
+        if not embedding_config["api_key"]:
+            raise Exception("EMBEDDING_MODEL_API key not configured")
+        
+        # Prepare API request
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {embedding_config['api_key']}"
+        }
+        
+        payload = {
+            "inputs": [text]
+        }
+        
+        timeout = aiohttp.ClientTimeout(total=embedding_config["timeout"])
+        
+        # Make API call
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                embedding_config["api_url"],
+                headers=headers,
+                json=payload
+            ) as response:
+                
+                if response.status != 200:
+                    error_text = await response.text()
+                    raise Exception(f"DeepInfra API error {response.status}: {error_text}")
+                
+                result = await response.json()
+                
+                if "embeddings" not in result or not result["embeddings"]:
+                    raise Exception("Invalid response format from DeepInfra API")
+                
+                embedding_vector = result["embeddings"][0]
+                
+                if len(embedding_vector) != embedding_config["dimensions"]:
+                    raise Exception(f"Unexpected embedding dimensions: got {len(embedding_vector)}, expected {embedding_config['dimensions']}")
+                
+                logger.debug(f"Successfully generated embedding for text of length {len(text)}")
+                return embedding_vector
+        
     except Exception as e:
-        logger.error(f"Error generating embedding: {e}")
+        logger.error(f"Error generating embedding via DeepInfra API: {e}")
+        # Return zero vector as fallback
         return [0.0] * _vector_params.size
 
 # --- Common Search Functions ---

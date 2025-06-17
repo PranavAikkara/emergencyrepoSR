@@ -9,7 +9,6 @@ uvicorn
 pydantic
 python-dotenv
 qdrant-client
-sentence-transformers
 requests
 pandas
 aiohttp>=3.8.0
