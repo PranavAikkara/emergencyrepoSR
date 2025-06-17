@@ -58,3 +58,7 @@ class LLMJdCvComparisonOutput(BaseModel):
 class CandidateQuestionsOutput(BaseModel):
     technical_questions: List[DetailedQuestion]
     general_behavioral_questions: List[DetailedQuestion] 
+
+# New Pydantic model for JD keyword extraction output
+class JDKeywordsOutput(BaseModel):
+    keywords: List[str] = [] 

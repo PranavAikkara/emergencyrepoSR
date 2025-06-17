@@ -28,11 +28,12 @@ async def add_cv_to_db(
 ) -> Optional[str]:
     """
     Processes CV using LLM for chunking, then adds to cv_collection.
-    cv_metadata_with_links MUST include 'original_doc_id' (for the CV) and 'associated_jd_id'.
+    cv_metadata_with_links MUST include 'original_doc_id' (for the CV).
+    'associated_jd_id' is optional - CVs can be uploaded independently and later ranked against any JD.
     Accepts either base64 encoded content or raw text content.
     
     Args:
-        cv_metadata_with_links: Dictionary containing metadata and links to related documents
+        cv_metadata_with_links: Dictionary containing metadata and optional links to related documents
         cv_base64_content: Base64 encoded content of the CV file
         cv_raw_text_content: Raw text content of the CV
         content_type: MIME type of the content
@@ -43,10 +44,10 @@ async def add_cv_to_db(
     if not cv_metadata_with_links.get("original_doc_id"):
         logger.error("Error: 'original_doc_id' for the CV must be provided in cv_metadata_with_links.")
         return None 
-    if not cv_metadata_with_links.get("associated_jd_id"):
-        logger.error("Error: 'associated_jd_id' must be provided in cv_metadata_with_links.")
-        return None
-        
+    
+    # Note: associated_jd_id is now optional since CVs can be uploaded independently
+    # and later ranked against any JD using the UUID-based ranking system
+    
     cv_id = cv_metadata_with_links['original_doc_id']
     logger.info(f"Processing CV (ID: {cv_id}) for vector DB using LLM chunking...")
     

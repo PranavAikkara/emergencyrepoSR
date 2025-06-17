@@ -7,12 +7,13 @@ load_dotenv()
 
 qdrant_api_key = os.getenv("QDRANT_API_KEY")
 
-# S3 Configuration
+# Debug: Check if API key is loaded (don't log the actual key for security)
+print(f"Qdrant API Key loaded: {'Yes' if qdrant_api_key else 'No'}")
+
+# S3 Configuration - Uses environment variables for deployment flexibility
 S3_CONFIG = {
-    "default_bucket": "your-smart-recruit-bucket",  # Placeholder - update with actual bucket name
-    "region": "ap-south-1",  # Default region - update as needed
-    "max_file_size_mb": 50,  # Maximum file size to process from S3
-    "aws_profile": "AWSAdministratorAccess-024848453356",  # AWS profile to use for SSO
+    "default_bucket": os.getenv("S3_BUCKET", "your-smart-recruit-bucket"),  # Set via environment variable
+    "region": os.getenv("AWS_REGION", "ap-south-1"),  # Default region - can be overridden
 }
 
 qdrant_client = AsyncQdrantClient(

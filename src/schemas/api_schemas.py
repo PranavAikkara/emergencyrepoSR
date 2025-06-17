@@ -75,5 +75,39 @@ class S3JDUploadRequest(BaseModel):
 
 class S3CVUploadRequest(BaseModel):
     """Request model for single CV upload from S3"""
-    s3_uri: str  # Format: s3://bucket-name/folder/file.pdf
-    jd_id: str 
+    s3_uri: str  # Format: s3://bucket-name/folder/file.pdf 
+
+# JD Keywords Generation Schemas
+class JDKeywordsRequest(BaseModel):
+    """Request model for JD keywords generation endpoint"""
+    jd_id: str
+
+class JDKeywordsResponse(BaseModel):
+    """Response model for JD keywords generation endpoint"""
+    jd_id: str
+    keywords: List[str]
+    error: Optional[str] = None
+
+# Local File Upload Schemas
+class LocalJDUploadResponse(BaseModel):
+    """Response model for local JD file upload endpoint"""
+    jd_id: str
+    filename: str
+    jd_data: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+class LocalCVUploadResult(BaseModel):
+    """Model for individual CV upload result in batch upload"""
+    cv_id: Optional[str] = None
+    success: bool
+    filename: str
+    cv_data: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+class LocalMultipleCVUploadResponse(BaseModel):
+    """Response model for multiple CV files upload endpoint"""
+    total_files: int
+    successful_uploads: int
+    failed_uploads: int
+    results: List[LocalCVUploadResult]
+    processing_time_seconds: float 

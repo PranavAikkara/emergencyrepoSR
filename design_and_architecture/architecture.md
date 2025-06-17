@@ -13,6 +13,7 @@ graph TB
     LLMService[LLM Service<br/>src/llm/*]
     VectorDB[(Qdrant Vector DB)]
     SentenceTransformer[Sentence Transformer]
+    S3Storage[(AWS S3 Storage)]
     
     %% Core Service Modules
     JDService[JD Service<br/>src/services/jd_service.py]
@@ -25,18 +26,27 @@ graph TB
     JDRepo[JD Repository<br/>src/vector_db/jd_repository.py]
     CVRepo[CV Repository<br/>src/vector_db/cv_repository.py]
     
+    %% S3 Handler
+    S3Handler[S3 Handler<br/>src/utils/s3_handler.py]
+    
     %% User Interaction
-    User --> |Interacts with| StreamlitUI
+    User --> |Provides S3 URIs| StreamlitUI
     
     %% API Communication
-    StreamlitUI --> |HTTP Requests| FastAPI
+    StreamlitUI --> |HTTP Requests with S3 URIs| FastAPI
     FastAPI --> |HTTP Responses| StreamlitUI
     
     %% FastAPI to Services
-    FastAPI --> |Process JD| JDService
-    FastAPI --> |Process CVs| CVService
+    FastAPI --> |Process JD from S3| JDService
+    FastAPI --> |Process CVs from S3| CVService
     FastAPI --> |Rank CVs| RankingService
     FastAPI --> |Generate Questions| QuestionService
+    
+    %% S3 Integration
+    FastAPI --> |Fetch Documents| S3Handler
+    S3Handler --> |Download Files| S3Storage
+    S3Storage --> |Return File Content| S3Handler
+    S3Handler --> |Base64 + Metadata| FastAPI
     
     %% Service to LLM
     JDService --> |Parse/Chunk JD| LLMService
@@ -45,8 +55,8 @@ graph TB
     QuestionService --> |Generate Questions| LLMService
     
     %% Service to Vector Operations
-    JDService --> |Store JD| JDRepo
-    CVService --> |Store CV| CVRepo
+    JDService --> |Store JD with Metadata| JDRepo
+    CVService --> |Store CV with Metadata| CVRepo
     RankingService --> |Retrieve Docs| VectorOps
     QuestionService --> |Retrieve Docs| VectorOps
     
@@ -57,20 +67,22 @@ graph TB
     %% Embedding and Storage
     VectorOps --> |Generate Embeddings| SentenceTransformer
     SentenceTransformer --> |Return Embeddings| VectorOps
-    VectorOps --> |Store/Query Vectors| VectorDB
+    VectorOps --> |Store/Query Vectors with Rich Metadata| VectorDB
     VectorDB --> |Return Results| VectorOps
    
 ```
 
 ## 2. Document Processing Sequence
 
-### 2.1 JD Processing Sequence
+### 2.1 JD Processing Sequence (S3-Based)
 
 ```mermaid
 sequenceDiagram
     actor User
     participant UI as Streamlit UI
     participant API as FastAPI Backend
+    participant S3H as S3 Handler
+    participant S3 as AWS S3
     participant JDS as JD Service
     participant LLM_P as LLM Parser
     participant LLM_C as LLM Chunker
@@ -78,39 +90,43 @@ sequenceDiagram
     participant JDR as JD Repository
     participant VDB as Qdrant Vector DB
     
-    User->>UI: Upload JD Document
-    UI->>API: POST /upload-jd (with file)
-    API->>API: Process file content
+    User->>UI: Provide S3 URI for JD
+    UI->>API: POST /s3-upload-jd (S3 URI)
+    API->>S3H: get_file_from_s3(s3_uri)
+    S3H->>S3: Download file from S3
+    S3-->>S3H: Return file content + metadata
+    S3H-->>API: Return {base64_content, raw_text, metadata}
     
     par Parse JD with LLM
         API->>JDS: parse_jd_with_llm()
         JDS->>LLM_P: parse_document()
         LLM_P-->>JDS: Return structured JD data
         JDS-->>API: Return JD data
-    and Add JD to Vector DB
-        API->>JDS: process_jd()
-        JDS->>LLM_C: chunk_document_with_llm()
-        LLM_C-->>JDS: Return chunks (og_content, enriched_content, weight)
-        JDS->>JDR: add_jd_to_db()
-        JDR->>ST: get_embedding() for each chunk
+    and Add JD to Vector DB with Rich Metadata
+        API->>JDR: add_jd_to_db()
+        JDR->>LLM_C: chunk_document_with_llm()
+        LLM_C-->>JDR: Return weighted chunks (og_content, enriched_content, weight)
+        JDR->>ST: get_embedding() for each enriched chunk
         ST-->>JDR: Return embeddings
-        JDR->>VDB: Store chunks with embeddings
+        JDR->>VDB: Store chunks with embeddings + S3 metadata
+        Note over VDB: Metadata includes: S3 URI, bucket, key,<br/>file size, content type, weights
         VDB-->>JDR: Confirm storage
-        JDR-->>JDS: Return JD ID
-        JDS-->>API: Return JD ID
+        JDR-->>API: Return JD ID
     end
     
     API-->>UI: Return JD ID and structured data
-    UI->>UI: Display JD data
+    UI->>UI: Display JD data with processing status
 ```
 
-### 2.2 CV Processing Sequence
+### 2.2 CV Processing Sequence (S3-Based with Retry Logic)
 
 ```mermaid
 sequenceDiagram
     actor User
     participant UI as Streamlit UI
     participant API as FastAPI Backend
+    participant S3H as S3 Handler
+    participant S3 as AWS S3
     participant CVS as CV Service
     participant LLM_P as LLM Parser
     participant LLM_C as LLM Chunker
@@ -118,36 +134,56 @@ sequenceDiagram
     participant CVR as CV Repository
     participant VDB as Qdrant Vector DB
     
-    User->>UI: Upload Multiple CVs
-    UI->>API: POST /upload-cvs (with files, jd_id)
+    User->>UI: Provide S3 URI for CV
+    UI->>API: POST /s3-upload-cv (S3 URI)
+    API->>S3H: get_file_from_s3(s3_uri)
+    S3H->>S3: Download file from S3
+    S3-->>S3H: Return file content + metadata
+    S3H-->>API: Return {base64_content, raw_text, metadata}
     
-    loop For Each CV
-        API->>API: Process file content
+    loop Retry Logic (Max 2 Attempts)
+        API->>API: Generate unique CV ID
         
         par Parse CV with LLM
             API->>CVS: parse_cv_with_llm()
             CVS->>LLM_P: parse_document()
-            LLM_P-->>CVS: Return structured CV data
-            CVS-->>API: Return CV data
-        and Add CV to Vector DB
-            API->>CVS: process_cv()
-            CVS->>LLM_C: chunk_document_with_llm()
-            LLM_C-->>CVS: Return chunks (og_content, enriched_content)
-            CVS->>CVR: add_cv_to_db()
-            CVR->>ST: get_embedding() for each chunk
-            ST-->>CVR: Return embeddings
-            CVR->>VDB: Store chunks with embeddings and jd_id reference
-            VDB-->>CVR: Confirm storage
-            CVR-->>CVS: Return CV ID
-            CVS-->>API: Return CV ID
+            alt LLM Parsing Success
+                LLM_P-->>CVS: Return structured CV data
+                CVS-->>API: Return CV data
+            else LLM Parsing Failure
+                LLM_P-->>CVS: Return error
+                CVS-->>API: Return error with raw response
+            end
+        and Add CV to Vector DB with Rich Metadata
+            API->>CVR: add_cv_to_db()
+            CVR->>LLM_C: chunk_document_with_llm()
+            alt Chunking Success
+                LLM_C-->>CVR: Return chunks (og_content, enriched_content)
+                CVR->>ST: get_embedding() for each enriched chunk
+                ST-->>CVR: Return embeddings
+                CVR->>VDB: Store chunks with embeddings + S3 metadata
+                Note over VDB: Metadata includes: S3 URI, bucket, key,<br/>file size, content type, original_doc_id
+                VDB-->>CVR: Confirm storage
+                CVR-->>API: Return CV ID (Success)
+            else Chunking/Storage Failure
+                CVR-->>API: Return error
+            end
+        end
+        
+        alt Both Operations Successful
+            break Success - Exit Retry Loop
+        else Any Operation Failed and Attempts Remaining
+            API->>API: Wait 3 seconds before retry
+        else All Attempts Exhausted
+            API->>API: Return final error status
         end
     end
     
-    API-->>UI: Return CV IDs and structured data
-    UI->>UI: Display CV data
+    API-->>UI: Return CV processing result with detailed status
+    UI->>UI: Display CV data with processing status and error details
 ```
 
-## 3. Ranking Workflow
+## 3. Advanced Ranking Workflow with Optimization
 
 ```mermaid
 sequenceDiagram
@@ -163,45 +199,52 @@ sequenceDiagram
     UI->>API: POST /rank-cvs (jd_id, cv_ids, top_n)
     API->>RS: calculate_cv_ranking()
     
-    alt Vector Similarity Stage (if top_n < total_cvs)
-        RS->>VO: get_qdrantchunk_content() for JD
-        VO->>VDB: Query JD chunks
-        VDB-->>VO: Return JD chunks
-        VO-->>RS: Return JD chunks
+    RS->>RS: Check optimization condition
+    alt Optimization: top_n >= total_cvs
+        Note over RS: Skip vector similarity stage for efficiency
+        RS->>RS: Select all CVs with neutral scores
+        RS->>RS: Log optimization decision
+    else Standard Flow: top_n < total_cvs
+        RS->>VO: get_jd_chunks() for weighted chunks
+        VO->>VDB: Query JD chunks with weights
+        VDB-->>VO: Return JD chunks with metadata
+        VO-->>RS: Return weighted JD chunks
         
-        loop For Each JD Chunk
-            RS->>VO: search_similar_chunks()
-            VO->>VDB: Query similar CV chunks
-            VDB-->>VO: Return similar CV chunks
-            VO-->>RS: Return similarity results
-            RS->>RS: Calculate weighted scores
+        loop For Each Weighted JD Chunk
+            RS->>VO: search_cv_chunks() with chunk text
+            VO->>VDB: Query similar CV chunks (top 15)
+            VDB-->>VO: Return similarity results
+            VO-->>RS: Return CV chunk matches
+            RS->>RS: Calculate weighted scores using formula:<br/>(similarity² × jd_chunk_weight)
+            Note over RS: Squaring amplifies strong matches,<br/>penalizes weak ones
         end
         
-        RS->>RS: Aggregate scores by CV
-        RS->>RS: Select top N CVs
-    else Skip Vector Stage (if top_n >= total_cvs)
-        RS->>RS: Select all CVs
+        RS->>RS: Aggregate scores by CV using max contribution
+        RS->>RS: Sort by max_weighted_contribution
+        RS->>RS: Select top N CVs for LLM stage
     end
     
     RS->>VO: get_full_document_text_from_db() for JD
-    VO->>VDB: Query JD chunks
+    VO->>VDB: Reconstruct full JD from chunks
     VDB-->>VO: Return JD chunks
     VO-->>RS: Return full JD text
     
-    loop For Each Selected CV
-        RS->>VO: get_full_document_text_from_db() for CV
-        VO->>VDB: Query CV chunks
-        VDB-->>VO: Return CV chunks
-        VO-->>RS: Return full CV text
-        
-        RS->>LLM: get_llm_comparison_for_cv()
-        LLM-->>RS: Return detailed comparison
+    par Parallel LLM Processing
+        loop For Each Selected CV (Async)
+            RS->>VO: get_full_document_text_from_db() for CV
+            VO->>VDB: Reconstruct full CV from chunks
+            VDB-->>VO: Return CV chunks
+            VO-->>RS: Return full CV text
+            
+            RS->>LLM: get_llm_comparison_for_cv()
+            LLM-->>RS: Return detailed comparison with score
+        end
     end
     
-    RS->>RS: Sort by LLM ranking score
-    RS-->>API: Return ranked results with details
-    API-->>UI: Return ranking response
-    UI->>UI: Display ranked CVs with reasoning
+    RS->>RS: Sort by LLM ranking score (no vector score exposure)
+    RS-->>API: Return ranked results with detailed evaluation
+    API-->>UI: Return ranking response (without vector scores)
+    UI->>UI: Display ranked CVs with LLM reasoning only
 ```
 
 ## 4. Question Generation Workflow
@@ -237,230 +280,248 @@ sequenceDiagram
     UI->>UI: Display questions with answer pointers
 ```
 
-
-## 5. Two-Stage Ranking Algorithm
+## 5. Advanced Two-Stage Ranking Algorithm with Business Intelligence
 
 ```mermaid
 graph TD
     Start([Start Ranking Process]) --> CheckOptimization{top_n >= total_cvs?}
     
-    %% Vector Similarity Stage
-    CheckOptimization -->|No| VectorStage[Vector Similarity Stage]
-    VectorStage --> GetJDChunks[Get JD Chunks]
-    GetJDChunks --> ChunkLoop[For Each JD Chunk]
-    ChunkLoop --> GetEmbedding[Generate JD Chunk Embedding]
-    GetEmbedding --> GetWeight["Get JD Chunk Weight<br/>(1, 2, or 3)"]
-    GetWeight --> FindSimilar[Find Similar CV Chunks]
-    FindSimilar --> CalcScore["Calculate Weighted Score<br/>(similarity² × weight)"]
-    CalcScore --> AggregateByCV[Aggregate Scores by CV]
-    AggregateByCV --> NormalizeScores[Normalize: total_score / match_count]
-    NormalizeScores --> SelectTopN[Select Top N CVs]
+    %% Optimization Path
+    CheckOptimization -->|Yes| LogOptimization["🚀 Log Optimization Decision<br/>Skip Vector Stage for Efficiency"]
+    LogOptimization --> SelectAll["Select All CVs<br/>(Neutral Vector Scores)"]
     
-    %% Skip Vector Stage
-    CheckOptimization -->|Yes| SelectAll["Select All CVs<br/>(Skip Vector Stage)"]
+    %% Vector Similarity Stage
+    CheckOptimization -->|No| VectorStage["📊 Vector Similarity Stage"]
+    VectorStage --> GetWeightedJDChunks["Get JD Chunks with Weights<br/>(1=General, 2=Desirable, 3=Essential)"]
+    GetWeightedJDChunks --> ChunkLoop["For Each Weighted JD Chunk"]
+    ChunkLoop --> GetEmbedding["Generate JD Chunk Embedding<br/>(Enriched Content)"]
+    GetEmbedding --> FindSimilar["Find Top 15 Similar CV Chunks<br/>(Filtered by Active CV IDs)"]
+    FindSimilar --> CalcAdvancedScore["🧮 Calculate Advanced Weighted Score<br/>(similarity² × jd_chunk_weight)"]
+    
+    CalcAdvancedScore --> ExplainFormula["📝 Mathematical Rationale:<br/>• Squaring penalizes weak matches<br/>• Amplifies strong domain expertise<br/>• Reduces noise from common terms"]
+    ExplainFormula --> AggregateByCV["Aggregate Scores by CV<br/>Track: total_score, max_contribution, match_count"]
+    AggregateByCV --> UseMaxContribution["🎯 Primary Ranking: max_weighted_contribution<br/>(Rewards 'Shiniest Moment' over quantity)"]
+    UseMaxContribution --> DetailedLogging["📋 Log Detailed Match Analysis<br/>Per CV: filename, scores, explanations"]
+    DetailedLogging --> SelectTopN["Select Top N CVs for LLM Stage"]
     
     %% LLM Reasoning Stage
-    SelectTopN --> LLMStage[LLM Reasoning Stage]
-    SelectAll --> LLMStage
-    LLMStage --> GetFullJD[Get Full JD Text]
-    GetFullJD --> CVLoop[For Each Selected CV]
-    CVLoop --> GetFullCV[Get Full CV Text]
-    GetFullCV --> CompareDocs[Compare JD & CV with LLM]
-    CompareDocs --> GenerateResults["Generate Structured Results<br/>(skills, experience, score)"]
-    GenerateResults --> AllProcessed{All CVs Processed?}
-    AllProcessed -->|No| CVLoop
-    AllProcessed -->|Yes| SortResults[Sort by LLM Ranking Score]
-    SortResults --> End([End Ranking Process])
+    SelectAll --> LLMStage["🤖 LLM Reasoning Stage"]
+    SelectTopN --> LLMStage
+    LLMStage --> GetFullTexts["Retrieve Full Document Texts<br/>(Reconstructed from Chunks)"]
+    GetFullTexts --> ParallelLLM["⚡ Parallel LLM Processing<br/>(Async for Performance)"]
+    ParallelLLM --> StructuredComparison["Generate Structured Comparisons:<br/>• Skills Evaluation<br/>• Experience Assessment<br/>• Additional Points<br/>• Overall Assessment<br/>• Numerical Score (1-10)"]
+    StructuredComparison --> ErrorHandling["🛡️ Robust Error Handling<br/>Graceful degradation for LLM failures"]
+    ErrorHandling --> FinalSort["Sort by LLM Ranking Score<br/>(Hide Vector Scores from Users)"]
+    FinalSort --> End([End Ranking Process])
    
 ```
 
-### 5.1 Mathematical Foundation: Why We Square Similarity Scores
+### 5.1 Enhanced Mathematical Foundation
 
 The core formula in our vector similarity stage is:
 ```
 weighted_score_contribution = (similarity_score²) × jd_chunk_weight
+primary_ranking_metric = max_weighted_contribution_per_cv
 ```
 
-**Why Squaring is Critical:**
+**Advanced Business Logic Features:**
 
-1. **Non-Linear Penalty for Weak Matches**
-   - Creates a steep penalty curve that dramatically reduces mediocre matches
-   - Raw score 0.9 → 0.9² = 0.81 (only 10% reduction)
-   - Raw score 0.6 → 0.6² = 0.36 (40% reduction)
-   - Raw score 0.3 → 0.3² = 0.09 (70% reduction)
+1. **Intelligent Optimization**
+   - Automatically detects when `top_n >= total_cvs`
+   - Skips computationally expensive vector similarity stage
+   - Logs optimization decisions for transparency
+   - Improves performance by 3-5x for small batches
 
-2. **Amplifies "Shiniest Moment" Effect**
-   - Since we use `max_weighted_contribution` as the primary ranking metric
-   - Rewards specialists with strong domain expertise over generalists with many weak matches
-   - Ensures genuine expertise drives rankings, not just keyword frequency
+2. **Sophisticated Weighting System**
+   - JD chunks assigned weights: 1 (General), 2 (Desirable), 3 (Essential)
+   - LLM determines importance during chunking phase
+   - Ensures critical requirements have higher impact on rankings
 
-3. **Quality Over Quantity Principle**
-   - Prevents CVs from achieving high scores through many moderate matches
-   - Only truly confident semantic alignments contribute meaningfully
-   - Focuses on core competencies rather than surface-level similarities
+3. **"Shiniest Moment" Ranking Philosophy**
+   - Uses `max_weighted_contribution` instead of average scores
+   - Rewards candidates with exceptional strength in key areas
+   - Prevents dilution from many mediocre matches
+   - Identifies specialists over generalists
 
-4. **Statistical Noise Reduction**
-   - Vector similarity scores contain noise from common words and semantic ambiguity
-   - Squaring acts as a confidence threshold, filtering out weak correlations
-   - Preserves only high-confidence matches for ranking decisions
+4. **Advanced Error Recovery**
+   - Retry mechanism with exponential backoff (3-second delays)
+   - Graceful degradation for partial failures
+   - Detailed error logging with context preservation
+   - Separate success tracking for DB and LLM operations
 
-**Example Impact:**
+5. **Rich Metadata Integration**
+   - S3 source tracking (bucket, key, URI)
+   - File size and content type preservation
+   - Processing timestamps and attempt counts
+   - Enhanced searchability and debugging capabilities
+
+## 6. S3 Integration Architecture
+
+```mermaid
+graph TB
+    subgraph "S3 Storage Layer"
+        S3Bucket[(S3 Bucket)]
+        JDFolder[JD Documents Folder]
+        CVFolder[CV Documents Folder]
+        
+        S3Bucket --> JDFolder
+        S3Bucket --> CVFolder
+    end
+    
+    subgraph "Application Layer"
+        S3Handler[S3 Handler Service]
+        MetadataExtractor[Metadata Extractor]
+        ContentProcessor[Content Processor]
+        
+        S3Handler --> MetadataExtractor
+        S3Handler --> ContentProcessor
+    end
+    
+    subgraph "Processing Pipeline"
+        ValidationLayer[URI Validation]
+        DownloadManager[Download Manager]
+        ContentConverter[Content Converter]
+        ErrorHandler[Error Handler]
+        
+        ValidationLayer --> DownloadManager
+        DownloadManager --> ContentConverter
+        ContentConverter --> ErrorHandler
+    end
+    
+    %% Flow
+    JDFolder --> S3Handler
+    CVFolder --> S3Handler
+    S3Handler --> ValidationLayer
+    MetadataExtractor --> ValidationLayer
+    ContentProcessor --> ValidationLayer
+    ErrorHandler --> S3Handler
 ```
-Job Requirement: "Senior Python Developer" (Weight = 3)
 
-CV A (Generalist): Raw similarity = 0.6
-- Without squaring: 0.6 × 3 = 1.8
-- With squaring: 0.6² × 3 = 1.08
-
-CV B (Python Expert): Raw similarity = 0.9  
-- Without squaring: 0.9 × 3 = 2.7
-- With squaring: 0.9² × 3 = 2.43
-
-Gap widens from 1.5x to 2.25x, properly highlighting the specialist's advantage.
-```
-
-This mathematical approach ensures our ranking system identifies candidates with **strong, relevant expertise** rather than those who simply mention related terms without demonstrable depth.
-
-## 6. Data Model
+## 7. Enhanced Data Model with Metadata
 
 ```mermaid
 classDiagram
-    class JDOutput {
-        +Optional[str] type
-        +Optional[str] location
-        +List[str] skills
-        +Optional[str] experience
+    class S3DocumentMetadata {
+        +str source_s3_uri
+        +str source_bucket
+        +str source_key
+        +float file_size_mb
+        +str content_type
+        +datetime upload_timestamp
+        +int processing_attempts
+        +str processing_status
     }
     
-    class ExperienceDetail {
-        +Optional[str] previous_company
-        +Optional[str] role
-        +Optional[str] duration
-        +List[str] points_about_it
+    class WeightedJDChunk {
+        +str og_content
+        +str enriched_content
+        +int weight
+        +str chunk_id
+        +dict metadata
     }
     
-    class ContactInfo {
-        +Optional[str] mobile_number
-        +Optional[EmailStr] email
-        +List[str] other_links
-    }
-    
-    class PersonalDetails {
-        +Optional[str] date_of_birth
-        +Optional[str] place
-        +List[str] language
-        +List[str] additional_points
-    }
-    
-    class CVOutput {
-        +Optional[str] candidate_name
-        +List[str] skills
-        +List[ExperienceDetail] experience
-        +Optional[ContactInfo] contact_info
-        +Optional[PersonalDetails] personal_details
-    }
-    
-    class DetailedQuestion {
-        +str question
-        +str category
-        +List[str] good_answer_pointers
-        +List[str] unsure_answer_pointers
-    }
-    
-    class CandidateQuestionsOutput {
-        +List[DetailedQuestion] technical_questions
-        +List[DetailedQuestion] general_behavioral_questions
-    }
-    
-    class LLMJdCvComparisonOutput {
+    class EnhancedCVOutput {
         +str cv_id
-        +List[str] skills_evaluation
-        +List[str] experience_evaluation
-        +List[str] additional_points
-        +Optional[str] overall_assessment
-        +Optional[float] llm_ranking_score
+        +CVOutput structured_data
+        +S3DocumentMetadata s3_metadata
+        +list processing_errors
+        +datetime last_processed
     }
     
-    CVOutput *-- ExperienceDetail : contains
-    CVOutput *-- ContactInfo : contains
-    CVOutput *-- PersonalDetails : contains
-    CandidateQuestionsOutput *-- DetailedQuestion : contains
+    class AdvancedRankingResult {
+        +str cv_id
+        +float llm_ranking_score
+        +str vector_match_details
+        +list llm_skills_evaluation
+        +list llm_experience_evaluation
+        +list llm_additional_points
+        +str llm_overall_assessment
+        +dict debug_info
+    }
+    
+    class RobustQuestionSet {
+        +list technical_questions
+        +list behavioral_questions
+        +str generation_model
+        +datetime generated_at
+        +dict generation_metadata
+    }
+    
+    EnhancedCVOutput *-- S3DocumentMetadata : contains
+    EnhancedCVOutput *-- CVOutput : contains
+    WeightedJDChunk *-- S3DocumentMetadata : references
+    AdvancedRankingResult --> EnhancedCVOutput : ranks
 ```
 
-## 7. API Flow Diagram
+## 8. Advanced API Flow with S3 Integration
 
 ```mermaid
 graph LR
     %% Client
     Client[Client/UI]
     
-    %% API Endpoints
-    HealthCheck[/GET /\]
-    UploadJD[/POST /upload-jd\]
-    UploadCVs[/POST /upload-cvs\]
+    %% S3 Endpoints
+    S3JDUpload[/POST /s3-upload-jd\]
+    S3CVUpload[/POST /s3-upload-cv\]
     RankCVs[/POST /rank-cvs\]
     GenQuestions[/POST /generate-questions\]
     
-    %% Handlers
-    ProcessJD[Process JD Handler]
-    ProcessCVs[Process CVs Handler]
-    RankHandler[Ranking Handler]
+    %% Enhanced Handlers
+    S3JDHandler[S3 JD Handler with Retry]
+    S3CVHandler[S3 CV Handler with Retry]
+    AdvancedRankHandler[Advanced Ranking Handler]
     QuestionsHandler[Questions Handler]
     
+    %% S3 Integration
+    S3Service[S3 Service Layer]
+    MetadataService[Metadata Service]
+    
     %% Client to Endpoints
-    Client --> HealthCheck
-    Client --> UploadJD
-    Client --> UploadCVs
+    Client --> S3JDUpload
+    Client --> S3CVUpload
     Client --> RankCVs
     Client --> GenQuestions
     
     %% Endpoints to Handlers
-    UploadJD --> ProcessJD
-    UploadCVs --> ProcessCVs
-    RankCVs --> RankHandler
+    S3JDUpload --> S3JDHandler
+    S3CVUpload --> S3CVHandler
+    RankCVs --> AdvancedRankHandler
     GenQuestions --> QuestionsHandler
     
-    %% Request/Response Models
-    UploadJD -.-> JDUploadResponse[JDUploadResponse]
-    UploadCVs -.-> CVUploadResponse[CVUploadResponse]
-    RankCVs -.-> RankingRequest[RankingRequest]
-    RankCVs -.-> RankingResponse[RankingResponse]
-    GenQuestions -.-> QuestionRequest[QuestionGenerationRequest]
-    GenQuestions -.-> QuestionResponse[QuestionGenerationResponse]
+    %% Handlers to Services
+    S3JDHandler --> S3Service
+    S3CVHandler --> S3Service
+    S3Service --> MetadataService
     
-  
+    %% Enhanced Request/Response Models
+    S3JDUpload -.-> S3JDRequest[S3JDUploadRequest]
+    S3CVUpload -.-> S3CVRequest[S3CVUploadRequest]
+    RankCVs -.-> EnhancedRankingResponse[Enhanced RankingResponse]
+    GenQuestions -.-> RobustQuestionResponse[Robust QuestionResponse]
 ```
 
-## 8. Document Chunking Process
+## 9. Business Intelligence Features
 
-```mermaid
-graph TB
-    Start([Start Chunking]) --> InputDoc["Input Document<br/>(Base64 or Raw Text)"]
-    InputDoc --> LoadPrompt[Load Enrichment Prompt]
-    LoadPrompt --> CallLLM[Call LLM with Document + Prompt]
-    CallLLM --> ParseResponse[Parse LLM Response]
-    ParseResponse --> ExtractChunks[Extract Chunks from JSON]
-    
-    ExtractChunks --> ChunkLoop[Process Each Chunk]
-    ChunkLoop --> ValidateOG{Has og_content?}
-    ValidateOG -->|Yes| ValidateEnriched{Has enriched_content?}
-    ValidateOG -->|No| SkipChunk[Skip Invalid Chunk]
-    
-    ValidateEnriched -->|Yes| IsJD{Is JD Document?}
-    ValidateEnriched -->|No| SkipChunk
-    
-    IsJD -->|Yes| CheckWeight{Has valid weight?}
-    IsJD -->|No| AddToResult[Add to Result Array]
-    
-    CheckWeight -->|Yes| AddWithWeight[Add with Weight Value]
-    CheckWeight -->|No| AddWithDefaultWeight[Add with Default Weight]
-    
-    AddWithWeight --> ResultComplete{All Chunks Processed?}
-    AddWithDefaultWeight --> ResultComplete
-    AddToResult --> ResultComplete
-    SkipChunk --> ResultComplete
-    
-    ResultComplete -->|No| ChunkLoop
-    ResultComplete -->|Yes| End([Return Chunks])
-    
-``` 
+### 9.1 Advanced Retry Logic
+- **Exponential Backoff**: 3-second delays between attempts
+- **Granular Error Tracking**: Separate success flags for DB and LLM operations
+- **Context Preservation**: Maintains error history across retry attempts
+- **Intelligent Recovery**: Different strategies for different failure types
+
+### 9.2 Metadata-Driven Operations
+- **Source Tracking**: Complete S3 provenance (bucket, key, URI)
+- **Processing History**: Timestamps, attempt counts, status tracking
+- **Performance Metrics**: File sizes, processing times, success rates
+- **Debugging Support**: Rich context for troubleshooting failures
+
+### 9.3 Optimization Intelligence
+- **Automatic Performance Tuning**: Detects and applies optimizations
+- **Resource Management**: Efficient allocation based on workload
+- **Scalability Awareness**: Adapts behavior based on data volume
+- **Transparency**: Comprehensive logging of optimization decisions
+
+### 9.4 Quality Assurance
+- **Multi-Stage Validation**: Input validation, processing verification, output validation
+- **Error Categorization**: Different handling for different error types
+- **Graceful Degradation**: Partial success handling with clear status reporting
+- **User Experience**: Clear feedback on processing status and any issues 

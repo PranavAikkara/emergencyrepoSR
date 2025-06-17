@@ -1,10 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi_mcp import FastApiMCP
 from typing import List, Dict, Any, Optional
 import uvicorn
 import asyncio
 import uuid
+import time
 from contextlib import asynccontextmanager
 
 # Updated imports from new module structure - direct imports from specific modules
@@ -20,8 +21,10 @@ from src.services.jd_service import parse_jd_with_llm
 from src.services.cv_service import parse_cv_with_llm as parse_cv_with_llm
 from src.services.ranking_service import calculate_cv_ranking
 from src.services.question_service import generate_candidate_questions as core_generate_questions
+from src.services.jd_keyword_service import generate_jd_keywords_by_id
 from src.utils.logging import get_logger
 from src.utils.s3_handler import s3_handler
+from src.utils.file_handler import process_uploaded_file_content
 
 # Import the schema models from new location
 from src.schemas.api_schemas import (
@@ -35,6 +38,11 @@ from src.schemas.api_schemas import (
     Question,
     S3JDUploadRequest,
     S3CVUploadRequest,
+    JDKeywordsRequest,
+    JDKeywordsResponse,
+    LocalJDUploadResponse,
+    LocalCVUploadResult,
+    LocalMultipleCVUploadResponse,
 )
 
 # Setup logger
@@ -69,6 +77,11 @@ app.add_middleware(
 async def root():
     """Root endpoint to check if API is running"""
     return {"message": "Smart Recruit API is running"}
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for container health monitoring"""
+    return {"status": "healthy", "message": "Smart Recruit API is running"}
 
 # S3-based JD endpoint
 @app.post("/s3-upload-jd", response_model=JDUploadResponse, operation_id="s3_upload_jd")
@@ -135,11 +148,7 @@ async def s3_upload_jd(request: S3JDUploadRequest):
 async def s3_upload_cv(request: S3CVUploadRequest):
     """Upload and process single CV from S3 path"""
     try:
-        logger.info(f"Processing CV from S3: {request.s3_uri} for JD ID: {request.jd_id}")
-        
-        if not request.jd_id:
-            logger.error("S3 CV upload endpoint called without jd_id.")
-            raise HTTPException(status_code=400, detail="jd_id is required.")
+        logger.info(f"Processing CV from S3: {request.s3_uri}")
         
         # Get file from S3
         s3_file_data = await s3_handler.get_file_from_s3(request.s3_uri)
@@ -163,7 +172,7 @@ async def s3_upload_cv(request: S3CVUploadRequest):
         db_add_successful_last_attempt = False
 
         for attempt in range(max_attempts):
-            logger.info(f"Processing CV from S3: {filename}, CV ID: {cv_id_generated}, JD ID: {request.jd_id}, Attempt: {attempt + 1}/{max_attempts}")
+            logger.info(f"Processing CV from S3: {filename}, CV ID: {cv_id_generated}, Attempt: {attempt + 1}/{max_attempts}")
             current_attempt_error = None
             cv_data_from_llm_this_attempt = None
             db_add_successful_this_attempt = False
@@ -176,7 +185,6 @@ async def s3_upload_cv(request: S3CVUploadRequest):
                     content_type=actual_content_type,
                     cv_metadata_with_links={
                         "original_doc_id": cv_id_generated,
-                        "associated_jd_id": request.jd_id,
                         "original_filename": filename,
                         "source_s3_uri": request.s3_uri,
                         "source_bucket": s3_file_data["bucket"],
@@ -246,6 +254,296 @@ async def s3_upload_cv(request: S3CVUploadRequest):
         logger.error(f"Error processing CV from S3 in /s3-upload-cv endpoint: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error processing CV from S3: {str(e)}")
 
+# Local file upload endpoints
+@app.post("/upload-jd", response_model=LocalJDUploadResponse, operation_id="upload_jd")
+async def upload_jd(file: UploadFile = File(...)):
+    """Upload and process a single JD file from local storage"""
+    try:
+        logger.info(f"Processing local JD file: {file.filename}")
+        
+        # Validate file
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="No file provided")
+        
+        # Process the uploaded file
+        file_data = await process_uploaded_file_content(file)
+        
+        if file_data.get("error"):
+            logger.error(f"File processing error for JD {file.filename}: {file_data.get('error')}")
+            return LocalJDUploadResponse(
+                jd_id="",
+                filename=file.filename,
+                jd_data=None,
+                error=file_data.get("error")
+            )
+
+        filename = file_data["filename"]
+        raw_text = file_data["raw_text_content"]
+        base64_encoded = file_data["base64_content"]
+        actual_content_type = file_data["content_type"]
+        
+        # Add to database
+        jd_id = await add_jd_to_db(
+            jd_base64_content=base64_encoded,
+            jd_raw_text_content=raw_text,
+            content_type=actual_content_type,
+            jd_specific_metadata={
+                "original_filename": filename,
+                "source": "local_upload",
+                "upload_method": "direct_file"
+            }
+        )
+        
+        if not jd_id:
+            logger.error(f"Failed to add JD to vector DB: {filename}")
+            return LocalJDUploadResponse(
+                jd_id="",
+                filename=filename,
+                jd_data=None,
+                error="Failed to add JD to vector DB"
+            )
+        
+        # Parse with LLM
+        logger.info(f"Parsing JD with LLM for structured data: {filename}")
+        jd_data_from_llm = await parse_jd_with_llm(
+            jd_base64_content=base64_encoded,
+            jd_raw_text_content=raw_text,
+            content_type=actual_content_type
+        )
+
+        if "error" in jd_data_from_llm:
+            logger.warning(f"LLM parsing for JD {filename} resulted in an error: {jd_data_from_llm.get('error')}")
+            return LocalJDUploadResponse(
+                jd_id=jd_id,
+                filename=filename,
+                jd_data=jd_data_from_llm,
+                error=jd_data_from_llm.get('error')
+            )
+
+        logger.info(f"JD processing successful from local upload: {filename}, JD ID: {jd_id}")
+        return LocalJDUploadResponse(
+            jd_id=jd_id,
+            filename=filename,
+            jd_data=jd_data_from_llm,
+            error=None
+        )
+
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        logger.error(f"Error processing local JD file {file.filename}: {str(e)}", exc_info=True)
+        return LocalJDUploadResponse(
+            jd_id="",
+            filename=file.filename or "unknown",
+            jd_data=None,
+            error=f"Error processing JD file: {str(e)}"
+        )
+
+async def process_single_cv_async(file_data: Dict, cv_id: str) -> LocalCVUploadResult:
+    """Process a single CV file asynchronously with retry logic"""
+    filename = file_data["filename"]
+    raw_text = file_data["raw_text_content"]
+    base64_encoded = file_data["base64_content"]
+    actual_content_type = file_data["content_type"]
+    
+    max_attempts = 2
+    retry_delay_seconds = 2
+
+    for attempt in range(max_attempts):
+        logger.info(f"Processing CV: {filename}, CV ID: {cv_id}, Attempt: {attempt + 1}/{max_attempts}")
+        
+        try:
+            # Step 1: Add to DB
+            db_add_result_cv_id = await add_cv_to_db(
+                cv_base64_content=base64_encoded,
+                cv_raw_text_content=raw_text,
+                content_type=actual_content_type,
+                cv_metadata_with_links={
+                    "original_doc_id": cv_id,
+                    "original_filename": filename,
+                    "source": "local_upload",
+                    "upload_method": "batch_file_upload"
+                }
+            )
+            
+            if not db_add_result_cv_id:
+                current_error = "Failed to add CV to vector DB."
+                logger.error(f"{current_error} - Filename: {filename} (Attempt {attempt + 1})")
+                if attempt == max_attempts - 1:
+                    return LocalCVUploadResult(
+                        cv_id=None,
+                        success=False,
+                        filename=filename,
+                        cv_data={"error": current_error},
+                        error=current_error
+                    )
+                await asyncio.sleep(retry_delay_seconds)
+                continue
+
+            logger.info(f"CV added to DB successfully: {filename}, CV ID: {cv_id} (Attempt {attempt + 1})")
+
+            # Step 2: Parse with LLM
+            llm_parse_result_dict = await parse_cv_with_llm( 
+                cv_base64_content=base64_encoded,
+                cv_raw_text_content=raw_text,
+                content_type=actual_content_type
+            )
+            cv_data_from_llm = llm_parse_result_dict.get("structured_data")
+
+            if not cv_data_from_llm or (isinstance(cv_data_from_llm, dict) and "error" in cv_data_from_llm):
+                llm_error_msg = cv_data_from_llm.get('error', 'Unknown LLM parsing error') if isinstance(cv_data_from_llm, dict) else "LLM parsing returned no data"
+                current_error = f"LLM Parsing Error: {llm_error_msg}"
+                logger.warning(f"{current_error} for {filename} (Attempt {attempt + 1})")
+                
+                if attempt == max_attempts - 1:
+                    # DB was successful, but LLM failed - still return the CV ID
+                    return LocalCVUploadResult(
+                        cv_id=cv_id,
+                        success=False,
+                        filename=filename,
+                        cv_data=cv_data_from_llm if cv_data_from_llm else {"error": current_error},
+                        error=current_error
+                    )
+                await asyncio.sleep(retry_delay_seconds)
+                continue
+            
+            # Success!
+            logger.info(f"CV processing fully successful: {filename}, CV ID: {cv_id}")
+            return LocalCVUploadResult(
+                cv_id=cv_id,
+                success=True,
+                filename=filename,
+                cv_data=cv_data_from_llm,
+                error=None
+            )
+            
+        except Exception as e:
+            current_error = f"Unexpected exception: {str(e)}"
+            logger.error(f"{current_error} during CV processing: {filename} (Attempt {attempt + 1})", exc_info=True)
+            
+            if attempt == max_attempts - 1:
+                return LocalCVUploadResult(
+                    cv_id=None,
+                    success=False,
+                    filename=filename,
+                    cv_data={"error": current_error},
+                    error=current_error
+                )
+            await asyncio.sleep(retry_delay_seconds)
+    
+    # Fallback (should not reach here)
+    return LocalCVUploadResult(
+        cv_id=None,
+        success=False,
+        filename=filename,
+        cv_data={"error": "All attempts failed"},
+        error="All attempts failed"
+    )
+
+@app.post("/upload-cvs", response_model=LocalMultipleCVUploadResponse, operation_id="upload_cvs")
+async def upload_multiple_cvs(files: List[UploadFile] = File(...)):
+    """Upload and process multiple CV files from local storage asynchronously"""
+    start_time = time.time()
+    
+    try:
+        logger.info(f"Processing {len(files)} CV files from local upload")
+        
+        if not files:
+            raise HTTPException(status_code=400, detail="No files provided")
+        
+        # Validate files and process file content
+        file_data_list = []
+        cv_ids = []
+        
+        for file in files:
+            if not file.filename:
+                logger.warning(f"Skipping file with no filename")
+                continue
+                
+            # Process file content
+            file_data = await process_uploaded_file_content(file)
+            
+            if file_data.get("error"):
+                logger.error(f"File processing error for CV {file.filename}: {file_data.get('error')}")
+                # Add error result to process later
+                file_data_list.append({
+                    "filename": file.filename,
+                    "error": file_data.get("error"),
+                    "cv_id": None
+                })
+            else:
+                cv_id = str(uuid.uuid4())
+                cv_ids.append(cv_id)
+                file_data["cv_id"] = cv_id
+                file_data_list.append(file_data)
+        
+        # Process all CVs asynchronously
+        tasks = []
+        for file_data in file_data_list:
+            if file_data.get("error"):
+                # Create a task that returns the error immediately
+                async def create_error_result(filename, error_msg):
+                    return LocalCVUploadResult(
+                        cv_id=None,
+                        success=False,
+                        filename=filename,
+                        cv_data={"error": error_msg},
+                        error=error_msg
+                    )
+                tasks.append(create_error_result(file_data["filename"], file_data["error"]))
+            else:
+                tasks.append(process_single_cv_async(file_data, file_data["cv_id"]))
+        
+        # Execute all tasks concurrently
+        logger.info(f"Starting concurrent processing of {len(tasks)} CV files")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results
+        final_results = []
+        successful_count = 0
+        failed_count = 0
+        
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                # Handle exceptions that occurred during processing
+                filename = file_data_list[i].get("filename", f"file_{i}")
+                error_msg = f"Processing exception: {str(result)}"
+                logger.error(f"Exception processing CV {filename}: {error_msg}")
+                
+                final_results.append(LocalCVUploadResult(
+                    cv_id=None,
+                    success=False,
+                    filename=filename,
+                    cv_data={"error": error_msg},
+                    error=error_msg
+                ))
+                failed_count += 1
+            else:
+                final_results.append(result)
+                if result.success:
+                    successful_count += 1
+                else:
+                    failed_count += 1
+        
+        processing_time = time.time() - start_time
+        
+        logger.info(f"Multiple CV processing completed: {successful_count} successful, {failed_count} failed, {processing_time:.2f}s")
+        
+        return LocalMultipleCVUploadResponse(
+            total_files=len(files),
+            successful_uploads=successful_count,
+            failed_uploads=failed_count,
+            results=final_results,
+            processing_time_seconds=round(processing_time, 2)
+        )
+
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        processing_time = time.time() - start_time
+        logger.error(f"Error processing multiple CV files: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing CV files: {str(e)}")
+
 @app.post("/rank-cvs", response_model=RankingResponse, operation_id="rank_cvs")
 async def rank_cvs(request: RankingRequest):
     """Rank CVs against a job description using vector similarity and LLM reasoning."""
@@ -286,8 +584,6 @@ async def rank_cvs(request: RankingRequest):
                     score=float(cv_rank_item.get("llm_ranking_score", 0.0)),
                     evaluation={
                         "filename": cv_rank_item.get("filename", "N/A"),
-                        "initial_vector_score": cv_rank_item.get("initial_vector_score", 0.0),
-                        "vector_match_details": cv_rank_item.get("vector_match_details", "N/A"),
                         "llm_skills_evaluation": cv_rank_item.get("llm_skills_evaluation", []),
                         "llm_experience_evaluation": cv_rank_item.get("llm_experience_evaluation", []),
                         "llm_additional_points": cv_rank_item.get("llm_additional_points", []),
@@ -378,8 +674,47 @@ async def generate_questions(request: QuestionGenerationRequest):
         logger.error(f"Unexpected error in generate_questions for JD ID {request.jd_id}, CV ID {request.cv_id}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Unexpected error generating questions: {str(e)}")
 
-wiserecruit = FastApiMCP(app, include_operations=["s3_upload_jd", "s3_upload_cv", "rank_cvs", "generate_questions"])
-wiserecruit.mount()
+@app.post("/keyword_generation", response_model=JDKeywordsResponse, operation_id="keyword_generation")
+async def keyword_generation(request: JDKeywordsRequest):
+    """Generate searchable keywords for a job description."""
+    logger.info(f"Received request to generate keywords for JD ID: {request.jd_id}")
+    try:
+        jd_id = request.jd_id
+        
+        if not jd_id or not jd_id.strip():
+            logger.warning("Missing or empty jd_id in keyword generation request.")
+            raise HTTPException(status_code=400, detail="Missing or empty jd_id")
+        
+        logger.info(f"Calling generate_jd_keywords_by_id for JD ID: {jd_id}")
+        keywords_result = await generate_jd_keywords_by_id(jd_id)
+        
+        if "error" in keywords_result:
+            logger.error(f"Keyword generation failed for JD ID {jd_id}: {keywords_result['error']}")
+            return JDKeywordsResponse(
+                jd_id=jd_id,
+                keywords=[],
+                error=keywords_result["error"]
+            )
+        
+        # Extract keywords from the result
+        keywords_list = keywords_result.get("keywords", [])
+        
+        logger.info(f"Successfully generated {len(keywords_list)} keywords for JD ID: {jd_id}")
+        return JDKeywordsResponse(
+            jd_id=jd_id,
+            keywords=keywords_list,
+            error=None
+        )
+
+    except HTTPException as http_exc:
+        logger.error(f"HTTPException in keyword_generation for JD ID {request.jd_id if request else 'unknown'}: {http_exc.detail}")
+        raise http_exc
+    except Exception as e:
+        logger.error(f"Unexpected error in keyword_generation for JD ID {request.jd_id if request else 'unknown'}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Unexpected error generating keywords: {str(e)}")
+
+wiserecruit = FastApiMCP(app, include_operations=["s3_upload_jd", "s3_upload_cv", "upload_jd", "upload_cvs", "rank_cvs", "generate_questions", "keyword_generation"])
+wiserecruit.mount(mount_path="/wiserecruit_mcp")
 
 if __name__ == "__main__":
-    uvicorn.run("routes:app", host="127.0.0.1", port=8000, reload=True) 
+    uvicorn.run("routes:app", host="0.0.0.0", port=8000, reload=True) 

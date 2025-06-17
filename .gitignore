@@ -15,6 +15,10 @@ lambdatest_for_SR/
 new/
 others/
 refresh_aws_sso.py
+req_for_dev.txt
+Dockerfile
+docker-compose.yml
+.dockerignore
 
 
 

@@ -13,21 +13,17 @@ class S3Handler:
     
     def __init__(self):
         self.s3_config = get_s3_config()
-        self.max_file_size_mb = self.s3_config.get("max_file_size_mb", 50)
         try:
-            # Get AWS profile from config, fallback to default behavior if not specified
-            aws_profile = self.s3_config.get("aws_profile")
+            # Use standard AWS credential chain - this automatically handles:
+            # 1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+            # 2. IAM roles (for EC2, Lambda, ECS deployments)
+            # 3. AWS SSO profiles (if AWS_PROFILE env var is set)
+            # 4. ~/.aws/credentials file
+            # 5. EC2 instance metadata
             region = self.s3_config.get("region", "ap-south-1")
             
-            if aws_profile:
-                # Use specified profile (e.g., SSO profile)
-                session = boto3.Session(profile_name=aws_profile, region_name=region)
-                self.s3_client = session.client('s3')
-                logger.info(f"S3 handler initialized with profile '{aws_profile}' in region '{region}'")
-            else:
-                # Use default credential chain
-                self.s3_client = boto3.client('s3', region_name=region)
-                logger.info(f"S3 handler initialized with default credentials in region '{region}'")
+            self.s3_client = boto3.client('s3', region_name=region)
+            logger.info(f"S3 handler initialized in region '{region}' using AWS credential chain")
                 
         except Exception as e:
             logger.error(f"Failed to initialize S3 client: {e}")
@@ -80,9 +76,6 @@ class S3Handler:
                 response = self.s3_client.head_object(Bucket=bucket, Key=key)
                 file_size_bytes = response['ContentLength']
                 file_size_mb = file_size_bytes / (1024 * 1024)
-                
-                if file_size_mb > self.max_file_size_mb:
-                    raise ValueError(f"File size ({file_size_mb:.2f} MB) exceeds maximum allowed size ({self.max_file_size_mb} MB)")
                     
             except self.s3_client.exceptions.NoSuchKey:
                 raise ValueError(f"File not found in S3: {s3_uri}")

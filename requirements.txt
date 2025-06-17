@@ -1,14 +1,16 @@
 python-docx==1.1.2
 python-magic==0.4.27
 streamlit
+pydantic[email]
 litellm
 fastapi
+fastapi-mcp
 uvicorn
 pydantic
 python-dotenv
 qdrant-client
 sentence-transformers
-request
+requests
 pandas
 aiohttp>=3.8.0
 boto3>=1.35.0

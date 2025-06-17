@@ -135,8 +135,6 @@ async def calculate_cv_ranking(
             top_cvs_for_llm_stage.append({
                 "cv_id": cv_info["cv_id"],
                 "filename": cv_info.get("filename", f"CV_{cv_info['cv_id']}"),
-                "initial_vector_score": 0.5,  # Neutral score since we're skipping vector similarity
-                "vector_match_details": "Skipped vector similarity - ranking all CVs for efficiency",
                 "raw_total_score": 0.0,
                 "match_count": 0
             })
@@ -217,13 +215,11 @@ async def calculate_cv_ranking(
             initial_ranked_cvs.append({
                 "cv_id": cv_id,
                 "filename": data["filename"],
-                "initial_vector_score": data["max_weighted_contribution"], # Primary score for Stage 1
-                "vector_match_details": f"Max contribution score. Aggregated from {data['match_count']} vector matches. Details: {'; '.join(data['explanation_details'])}",
                 "raw_total_score": data["total_score"], # Keep for info
                 "match_count": data["match_count"] # Keep for info
             })
 
-        initial_ranked_cvs.sort(key=lambda x: x["initial_vector_score"], reverse=True)
+        initial_ranked_cvs.sort(key=lambda x: x["raw_total_score"], reverse=True)
         
         # Use the provided top_n for selective ranking
         num_llm_candidates = top_n if top_n is not None and top_n > 0 else 5
