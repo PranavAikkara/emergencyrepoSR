@@ -156,8 +156,7 @@ async def calculate_cv_ranking(
             for cv_id in active_cv_ids
         }
         
-        TOP_K_CV_CHUNKS_PER_JD_CHUNK = 15
-
+        TOP_K_CV_CHUNKS_PER_JD_CHUNK = 50
         # Detailed logging for Stage 1
         logger.info(f"[Ranking Stage 1 - Analysis] Starting Stage 1 for JD ID: {current_jd_id}. CVs to consider: {active_cv_ids}")
 
